@@ -5,10 +5,11 @@ use std::{
 
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
-} // this is a struct that holds a vector of JoinHandle values
+    sender: Option<mpsc::Sender<Job>>,
+} // this is a struct that holds a vector of workers and a sender. I workes like a router, and the sender is the channel that the workers use to communicate with each other
 
-type Job = Box<dyn FnOnce() + Send + 'static>; // this is a type alias for a trait object that implements the FnOnce trait
+// the Job type is an abstraction over the closure that we want to execute
+type Job = Box<dyn FnOnce() + Send + 'static>; // this is a type alias for a trait object that implements the FnOnce and the Send traits, while also being 'static
 
 impl ThreadPool {
     /// Create a new ThreadPool.
@@ -27,11 +28,15 @@ impl ThreadPool {
 
         let mut workers = Vec::with_capacity(size); // initialize a vector of workers as a fixed-size array which is more efficient than a vector
 
-        for id in 0..size { // iterate over the size of the thread pool
-            workers.push(Worker::new(id, Arc::clone (&receiver))); // push a new worker to the vector
+        for id in 0..size {
+            // iterate over the size of the thread pool
+            workers.push(Worker::new(id, Arc::clone(&receiver))); // push a new worker to the vector
         }
 
-        ThreadPool { workers, sender } // return the ThreadPool struct
+        ThreadPool {
+            workers,
+            sender: Some(sender),
+        } // return the ThreadPool struct
     }
 
     /// Executes the given closure in a thread.
@@ -39,27 +44,56 @@ impl ThreadPool {
     where
         F: FnOnce() + Send + 'static, // this trait bound is required for the closure to be able to be executed in a thread
     {
-        let job = Box::new(f); // create a boxed closure
+        let job = Box::new(f); // create a boxed closure of the given closure to be able to send it to the channel
 
-        self.sender.send(job).unwrap(); // send the closure to the channel
+        self.sender.
+        as_ref(). // get a reference to the sender
+        unwrap(). // unwrap the sender
+        send(job). // send the job to the channel
+        unwrap(); // unwrap the result of the send operation
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.sender.take()); // drop the sender
+
+        for worker in &mut self.workers { // iterate over the workers
+            println!("Shutting down worker {}", worker.id); // print a message
+
+            if let Some(thread) = worker.thread.take() { // optionally take the thread
+                thread.join().unwrap(); // join the thread
+            }
+        }
     }
 }
 
 struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>, // join handle is a value that represents a handle to a spawned thread
+    thread: Option<thread::JoinHandle<()>>, // optional JoinHandle value that will be None if the thread panics
 }
 
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker { // instantiate a new worker private function since it's only used in the ThreadPool struct
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
         let thread = thread::spawn(move || loop {
-            let job = receiver.lock().unwrap().recv().unwrap(); // lock the receiver and get the job
+            let message = receiver.lock().unwrap().recv();
 
-            println!("Worker {id} got a job; executing."); // print a message to the console
+            match message {
+                Ok(job) => {
+                    println!("Worker {id} got a job; executing.");
 
-            job(); // execute the job
-        }); // spawn a new thread and move the receiver into the closure to be able to use it
+                    job();
+                }
+                Err(_) => {
+                    println!("Worker {id} disconnected; shutting down.");
+                    break;
+                }
+            }
+        });
 
-        Worker { id, thread }
+        Worker {
+            id,
+            thread: Some(thread),
+        }
     }
 }
